@@ -3,11 +3,12 @@ using Distributions, StatsBase, Random
 using Plots
 using StaticArrays
 
+
 # cd("H:/Projects_shared/Bridge_PCR_sim")
 # include("bridge_PCR_launcher.jl")#
-# Pkg.add.(["Bio","BioAlignments","BioSequences","Distributions","StatsBase","Random","Plots","StaticArrays","FLoops"])
+#Pkg.add.(["Bio","BioAlignments","BioSequences","Distributions","StatsBase","Random","Plots","StaticArrays","FLoops"])
 
-
+#Pkg.build("CodecZlib")
 ###################################################
 # low level function library
 ###################################################
@@ -113,6 +114,7 @@ function update_site(site::Site)
     #println("old site",site)
     normalization_factor = 0
     L_MS = length(site.seq)
+    #println(site.free_neighbors)
     for i in 1:length(site.free_neighbors)
         distance = site.free_neighbors[i][2]
         p_interact_MS = p_end_to_end(L_MS, distance)
@@ -233,7 +235,7 @@ end
 """
 https://journals.aps.org/prl/abstract/10.1103/PhysRevLett.95.158105
 """
-function p_end_to_end(L::Int64, r::Float64) # L is the length of .... r is the distace 
+function p_end_to_end(L::Int64, r::Float64) # L is the length of the sequence r is the distace 
     s0 = L*lbp # calculating the countor length/ length at max physicall extension
     #p_end_to_end = (3/(2*π*L*lkuhn^2)^(3.0/2.0))*exp((-3.0*r)/(2*L*lkuhn^2))
     p_end_to_end = (r*exp(-1*s0/(8*lkuhn*(1-(r/s0)^2))))/((1-(r/s0)^2)*(2-(r/s0)^2)^2)
@@ -242,8 +244,10 @@ function p_end_to_end(L::Int64, r::Float64) # L is the length of .... r is the d
     #    p_cumulative += (r_i*exp(-1*s0/(8*lkuhn*(1-(r_i/s0)^2))))/((1-(r_i/s0)^2)*(2-(r_i/s0)^2)^2)
     #end
     if p_end_to_end < 0
+        #println(p_end_to_end)
         return 0
     else
+        #println(r)
         return p_end_to_end
     end
 end
@@ -319,23 +323,27 @@ function initialize_sites(site_positions::Array{Tuple{Float64, Float64}}, inputs
         y1 = site_positions[i][2]
         main_site = sites[site_positions[i]]
         L_MS = length(main_site.seq)
-        MS_cutoff = 136#L_MS*lbp # contour length is max - should be shorter though?
+        MS_cutoff =  L_MS*lbp  #136#L_MS*lbp # contour length is max - should be shorter though?
         
         for j in i+1:N 
             candidate_neighbor_site = sites[site_positions[j]]
             L_CNS = length(candidate_neighbor_site.seq)
-            CNS_cutoff = 136# L_CNS*lbp
+            CNS_cutoff = L_CNS*lbp #136# L_CNS*lbp
             x2 = site_positions[j][1]
             y2 = site_positions[j][2]
             distance = sqrt((x1-x2)^2+(y1-y2)^2) 
             p_interact_MS = p_end_to_end(L_MS, distance)
             p_interact_CNS = p_end_to_end(L_CNS, distance)
+            
             if MS_cutoff > distance
                 # then this candidate and the main site are technically neighbors - some more likely than others though
                 # since we are performing and update, we need to check first what the status of the free_neighbors lists are in both main and candidate sites
                 if isdefined(sites[(x1,y1)], 2)
                     # main site already has a free_neighbors entry, but it cannot have the candidate in it yet
                     # so in this case we will push the candidate to the existing entry
+                    #println("distance: ", distance)
+                    #
+                    #println("p_interact_MS: ", p_interact_MS)
                     push!(main_site.free_neighbors, ((x2,y2), distance, p_interact_MS))    
                 else
                     # then this is the first iteration on the main site and it also has never been added as a neighbor by a previous main site
@@ -382,12 +390,12 @@ end
 # run parameters
 ###########################################
 
-site_density = 0.02546473*.01#0.02546473*.01 #oligos per nm2
+site_density = 0.02546473*.01#0.02546473*.01#0.02546473*.01 #oligos per nm2 seems to be the minimal primer concentration needed to have a full coverd surface of PRIMERS not TEMPLATE
 spot_diameter = 1000.0*10#1000.0*10 #nm
 site_area = π*(spot_diameter/2)^2
 primer_concentration_nM = 0.0212568*.01 # see your own  calculation
 inputs = Uniform_bipartite_seed()
-inputs.proportions = [1,1,1,1,0.1,0.1]#[1,1,1,1,0.075,0.075]#[0.247,0.247,0.247,0.247,0.012,0.012] #[10,10,10,10,0.75,0.75]
+inputs.proportions = [1,1,1,1,0.1,0.1]#[1,1,1,1,0.075,0.075]#[0.247,0.247,0.247,0.247,0.012,0.012] #[10,10,10,10,0.75,0.75] means rigth now that the required concentration for the templates is 10 times lower than the primer concentration to get 0.1 polonie per nm^2
 inputs.sequences = [
     BioSequence{DNAAlphabet{4}}("GGCCAACGGTGTCTCAATCAAC"),# strand a
     BioSequence{DNAAlphabet{4}}("GCTGCTAAGCCGGACTGAATTC"), #strand b 
@@ -419,7 +427,7 @@ Random.seed!(1234);
 rejection_thresh = 10000
 
 
-open("0.1_propor_30_run_info.txt", "w") do io
+open("TS_run_info.txt", "w") do io
     write(io, "Number of cycles "*string(n_cycles)*" \n")
     write(io, "spot diameter: "*string(spot_diameter)*"nm \n")
     write(io, "spot area: "*string(site_area)*"nm2 \n")
@@ -462,7 +470,7 @@ a_ex = 0
 b_ex = 0
 for cycle in 1:n_cycles
     
-    output_tracking_plot([a_pol_f,a_pol_r,b_pol_f,b_pol_r],site_positions,"0.1_propor_30_test_"*string(cycle+1000)*".png")
+    output_tracking_plot([a_pol_f,a_pol_r,b_pol_f,b_pol_r],site_positions,"TS_test_"*string(cycle+1000)*".png")
 
     println("start of cycle: ", cycle, "number of long sites: ", length(long_sites), "extensions: ", extension_events)
     push!(extension_vector, extension_events)
@@ -481,6 +489,8 @@ for cycle in 1:n_cycles
             main_site = sites[candidate]
             
             weights = [j[3] for j in main_site.free_neighbors]
+            #println("weigths")
+            #println(weights)
             choices = [j[1] for j in main_site.free_neighbors]
             partner_coordinates = sample(choices, Weights(weights))
             partner_site = sites[partner_coordinates]
@@ -558,8 +568,10 @@ for cycle in 1:n_cycles
                                 #println(n_bases_2_fetch_seq_a)
                                 extension_b = reverse_complement(seq_a[1:n_bases_2_fetch_seq_a])
                                 seq_b_new = seq_b*extension_b
-                                sites[partner_coordinates].seq = seq_b_new                               
-                                sites[partner_coordinates] = update_site(sites[partner_coordinates])                                
+                                sites[partner_coordinates].seq = seq_b_new
+                                if isdefined(sites[partner_coordinates],2)                               
+                                    sites[partner_coordinates] = update_site(sites[partner_coordinates])  
+                                end                              
                                 update_strand_tracker!(a_pol_f,partner_coordinates,string(seq_b_new))
                                 update_strand_tracker!(a_pol_r,partner_coordinates,string(seq_b_new))
                                 update_strand_tracker!(b_pol_f,partner_coordinates,string(seq_b_new))
@@ -615,7 +627,7 @@ scatter(x_data, y_data, color="black",alpha=1,markerstrokewidth=.1,markersize=5,
 #plot!(x -> slope * x + intercept, label="Linear Fit")
 #plot!(yscale=log10, xscale=log10, color="black",alpha=1,markerstrokewidth=.1,markersize=5, label = "total extensions", ylabel = "number of extensions", xlabel = "cycle")
 plot!(size=(400,400))
-savefig("0.1_propor_30_extensions_per_cycle.png")
+savefig("TS_extensions_per_cycle.png")
 
 #yscale=:log10, xscale=:log10
 
@@ -629,13 +641,19 @@ savefig("0.1_propor_30_extensions_per_cycle.png")
 restriction_seq = "GAATTC"
 cut_index = 1
 new_long_sites = []
+
 for i in 1:length(long_sites)
+    #println(sites[long_sites[i]])
     inspected_seq = String(sites[long_sites[i]].seq)
     if occursin(restriction_seq, inspected_seq)
         #### MODIFY STRAND HERE WITH THE NEW SEQUENCE ####
         new_strand_index = findfirst(restriction_seq,inspected_seq)[1]+cut_index
         sites[long_sites[i]].seq = inspected_seq[1:new_strand_index-1]
-        sites[long_sites[i]] = update_site(sites[long_sites[i]])
+       # println("sites[long_sites[i]]")
+        if isdefined(sites[long_sites[i]],2)
+            #println(sites[long_sites[i]])
+            sites[long_sites[i]] = update_site(sites[long_sites[i]])
+        end
         #println(sites[long_sites[i]].seq)
     end
     if length(sites[long_sites[i]].seq) > length_thresh
@@ -645,7 +663,9 @@ end
 long_sites = deepcopy(new_long_sites)
 
 
-
+#Site(#undef, [((-9.001543194998913, 375.7729527725891), 51.74243076729821, 0.0937099411446475), ((104.38876386931513, 335.4418028615516), 87.34642404592036, 0.10136323675273644), ((52.76467989637632, 466.7006823249428), 74.02542557055816, 0.11315584713832766), ((89.7975392446969, 329.70823639938044), 81.55232571169753, 0.10962815177086253), ((83.08127759476048, 413.00158824186605), 47.61988508042923, 0.0874086185865718), ((83.91929610842547, 314.01881892862133), 91.39702378832834, 0.09227135893964199), ((15.683766848307457, 466.14571895918095), 76.08056076735745, 0.11290066293116471), ((99.7889732438571, 346.7457828540477), 76.5503887925398, 0.11277253609342129), ((51.853731565463555, 463.86772653383474), 71.0759829227508, 0.11271924463664844), ((51.43606317558907, 493.1479741933868), 99.98767494158835, 0.06407040200597759)], GCGGTTCCTGAACACGTTCGAAAAAAAAAAAAAAAAAAA…GTAAGCAAGAATGCTATATCCGCAGGAGTAACCCTAGAG)
+#sites[long_sites[i]]
+#Site(#undef, #undef, GCGGTTCCTGAACACGTTCGAAAAAAAAAAAAAAAAAAA…GTAAGCAAGAATGCTATATCCGCAGGAGTAACCCTAGAG)
 ######################################
 # second round of annealing after cut
 ######################################
@@ -655,7 +675,7 @@ n_cycles = n_cycles_2
 Temp = Temp_2
 extension_events = 0
 for cycle in 1:n_cycles
-    output_tracking_plot([a_pol_f,a_pol_r,b_pol_f,b_pol_r,tracker_400],site_positions,"0.1_propor_30_test_"*string(cycle+2000)*".png")
+    output_tracking_plot([a_pol_f,a_pol_r,b_pol_f,b_pol_r,tracker_400],site_positions,"TS_test_"*string(cycle+2000)*".png")
 
     #println("start of cycle: ", cycle, "number of long sites: ", length(long_sites), "extensions: ", extension_events)
     
@@ -725,8 +745,10 @@ for cycle in 1:n_cycles
                                 n_bases_2_fetch_seq_a = full_align.aln.a.aln.anchors[1].seqpos # number 5' bases to be copied from the top strand
                                 extension_b = reverse_complement(seq_a[1:n_bases_2_fetch_seq_a])
                                 seq_b_new = seq_b*extension_b
-                                sites[partner_coordinates].seq = seq_b_new                               
-                                sites[partner_coordinates] = update_site(sites[partner_coordinates])                                
+                                sites[partner_coordinates].seq = seq_b_new   
+                                if isdefined(sites[partner_coordinates],2)                            
+                                    sites[partner_coordinates] = update_site(sites[partner_coordinates])
+                                end                                
                                 update_strand_tracker!(a_pol_f,partner_coordinates,string(seq_b_new))
                                 update_strand_tracker!(a_pol_r,partner_coordinates,string(seq_b_new))
                                 update_strand_tracker!(b_pol_f,partner_coordinates,string(seq_b_new))
@@ -766,7 +788,7 @@ for cycle in 1:n_cycles
 end #cycle loop
 
 search_seq = BioSequence{DNAAlphabet{4}}("AAAAAAAAAAAAAAAAAAAAAATNNNNNNNNNNNNNNNNNNNNNNNNCGCGTATTGTCAACNNNNNNNNNNNNNNNNNNNNNNNNAGATCGGAAGAGCGTCGTGTCCCTATAGTG")
-writer_r1 = FASTQ.Writer(open("0.1_propor_30_edge_strands_direct.fastq", "w"))
+writer_r1 = FASTQ.Writer(open("TS_edge_strands_direct.fastq", "w"))
 
 for i in 1:length(long_sites)
     seq_i = sites[long_sites[i]].seq

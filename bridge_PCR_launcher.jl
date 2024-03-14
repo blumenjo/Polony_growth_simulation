@@ -2,6 +2,15 @@ using Bio, BioAlignments, BioSequences
 using Distributions, StatsBase, Random
 using Plots
 using StaticArrays
+using Profile
+using FLoops
+using SparseArrays
+using Base.Threads
+using Base.Iterators: partition
+using NearestNeighbors
+using Distributed
+using FileIO
+using Images
 
 
 # cd("H:/Projects_shared/Bridge_PCR_sim")
@@ -18,12 +27,16 @@ struct Random_poisson_parameters
 end
 
 mutable struct Site
+    #ID:: Int64
     interact_params::Vector{Float64} #parameters for the interaction probability distribution
     free_neighbors::Vector{Tuple{Tuple{Float64, Float64}, Float64,Float64}} #Vector{Neighbor_set}
     seq::BioSequence{DNAAlphabet{4}}
+    UMI::BioSequence{DNAAlphabet{4}}
+    #function Site()
+        #new(Vector{Float64}(), Vector{Tuple{Tuple{Float64, Float64}, Float64,Float64}}(), BioSequence{DNAAlphabet{4}}())
     Site() = new()
+    #end
 end
-
 
 
 mutable struct Uniform_bipartite_seed
@@ -42,14 +55,16 @@ mutable struct Strand_tracker
     Strand_tracker() = new()
 end
 
-
-
-
-
-
-
-
-
+#mutable struct Polony
+#    ID:: Int64
+#    farest_distance:: Vector{Int64, Tuple{Float64, Float64}}
+#    number_of_strands::Int64
+#    site_IDS:: Vector{Int64}
+ #   position_of_starting_strand:: Tuple{Float64, Float64}
+#    neighboor_polonies:: Vector{Int64}
+#    number_of_crosslinks:: Dict{Int64, Int64}()
+#    Polony() = new()
+#end
 
 
 
@@ -80,6 +95,7 @@ function update_strand_tracker!(tracker::Strand_tracker, coordinates, query_sequ
     end
     return tracker
 end
+
 function update_strand_tracker!(tracker::Strand_tracker, coordinates, query_length::Int64)
     if query_length > tracker.length
         push!(tracker.xs, coordinates[1])
@@ -87,6 +103,7 @@ function update_strand_tracker!(tracker::Strand_tracker, coordinates, query_leng
     end
     return tracker
 end
+
 function output_tracking_plot(trackers::Vector{Strand_tracker}, site_positions, plot_name::String)
     p = scatter([i[1] for i in site_positions],[i[2] for i in site_positions], color="#E4E4E4",alpha=0.5,markerstrokewidth=0,markersize=1,label = "primer sites")
     for tracker in trackers
@@ -110,6 +127,7 @@ function renormalize_site_probabilities(sites::Dict{Tuple{Float64, Float64}, Sit
     end
     return sites
 end
+
 function update_site(site::Site)
     #println("old site",site)
     normalization_factor = 0
@@ -164,7 +182,7 @@ function bc_gen(seq)
         end
         barcode = barcode*unique_barcode_letter
     end
-    return barcode
+    return barcode, unique_barcode
 end
 
 function get_p_annealing(Temp, T_m; 𝜅 = 40.) # 𝜅 = 40.  the "melting constant" the higher the number, the sharper the transition
@@ -239,7 +257,6 @@ function p_end_to_end(L::Int64, r::Float64) # L is the length of the sequence r 
     s0 = L*lbp # calculating the countor length/ length at max physicall extension
     #p_end_to_end = (3/(2*π*L*lkuhn^2)^(3.0/2.0))*exp((-3.0*r)/(2*L*lkuhn^2))
     p_end_to_end = (r*exp(-1*s0/(8*lkuhn*(1-(r/s0)^2))))/((1-(r/s0)^2)*(2-(r/s0)^2)^2)
-    #p_cumulative = 0
     #for r_i in 1:r
     #    p_cumulative += (r_i*exp(-1*s0/(8*lkuhn*(1-(r_i/s0)^2))))/((1-(r_i/s0)^2)*(2-(r_i/s0)^2)^2)
     #end
@@ -252,6 +269,61 @@ function p_end_to_end(L::Int64, r::Float64) # L is the length of the sequence r 
     end
 end
 
+
+function polony_size(list_with_original, dic_with_neighboors)
+    size = Dict{Int,  Float64}()
+    coor1= Dict{Int, Tuple{Float64, Float64}}()
+    coor2= Dict{Int, Tuple{Float64, Float64}}()
+   
+    for template in 1:length(list_with_original)
+        template_distance, longest_distance = 0, 0
+        X, Y, x, y = 0, 0, 0, 0
+        XY, xy = (), ()
+
+        x1 = list_with_original[template][1]
+        y1 = list_with_original[template][2]
+
+
+        for neighboor in dic_with_neighboors[template]
+       
+            x2 = neighboor[1]
+            y2 = neighboor[2]
+            
+            distance = sqrt((x1-x2)^2+(y1-y2)^2) 
+
+            if distance > template_distance || (distance == 0 && template_distance == 0)
+                template_distance = distance 
+                X = x2 
+                Y = y2
+            end 
+        end
+      
+        longest_distance = template_distance
+        
+        for neighboor in dic_with_neighboors[template]
+            x3 = neighboor[1]
+            y3 = neighboor[2]
+            
+            distance = sqrt((X-x3)^2+(Y-y3)^2) 
+
+            if distance > longest_distance
+                longest_distance = distance 
+                x = x3
+                y = y3
+        
+            end 
+        end
+        xy = (x,y)
+        XY =(X,Y)
+        size[template] = longest_distance
+        coor1[template]= xy
+        coor2[template]= XY
+    end
+    #println("Distance", size)
+    return size, coor1, coor2
+end
+
+
 ###################################################
 # high level function library
 ###################################################
@@ -261,10 +333,10 @@ Basic random Poisson distributed site generation
 function generate_site_positions(dist::Random_poisson_parameters)
     expected_N_points = dist.density*dist.simulation_area
     actual_N_points = rand(Poisson(expected_N_points)) #normalising with the possion distribution
-    site_positions::Array{Tuple{Float64, Float64}} = [] # empty array created to store the generated positions , it will store tuples of 2 points
+    site_positions::Array{Tuple{Float64, Float64}} = []  # empty array created to store the generated positions , it will store tuples of 2 points
     radius = sqrt(dist.simulation_area/π)
     println(expected_N_points)
-    for i in 1:actual_N_points  # loop to generate the random site points
+    for i in 1:actual_N_points # loop to generate the random site points
         random_radius = radius*sqrt(rand())
         random_angle = rand()*2*π
         y = random_radius*sin(random_angle)
@@ -282,15 +354,123 @@ threshold distance is used to reduce the number of neighbors
 site information recorded in this step are the coordinates (also used as dict keys)
 and the distance from site to neighbors for each neighbor
 """
+
+global pc = [] # empty list to store the coordinates from the initial sed templates, meaningn those tempaltes that attched in the first cycle 
+global p_seq = []
+
+
+
+function new_compute_distance(site_positions::Array{Tuple{Float64, Float64}},cutoff, N)
+    distance_dict = Dict{Int, Vector{Tuple{Int, Int, Float64}}}()
+
+    Threads.@threads for i in 1:N
+        local_distance = Vector{Tuple{Int, Int, Float64}}()
+        for j in (1+i):N
+            @inbounds begin
+                x1, y1 = site_positions[i]
+                x2, y2 = site_positions[j]
+                dis = sqrt((x1-x2)^2+(y1-y2)^2)
+                if dis <= cutoff
+                    push!(local_distance, (i, j, dis))
+                end
+            end
+        end
+        thread_id = Threads.threadid()
+        if haskey(distance_dict, thread_id)
+            append!(distance_dict[thread_id], local_distance)
+        else
+            distance_dict[thread_id]= local_distance
+        end
+    end
+    distance = vcat(values(distance_dict)...)
+    return distance
+end
+
+function matrix_compute_distance(site_positions::Array{Tuple{Float64, Float64}}, cutoff, N)
+    distance_dict = Dict{Int, Vector{Tuple{Int, Int, Float64}}}()
+
+    treeData = transpose(hcat(first.(site_positions), last.(site_positions)))
+    tree = KDTree(treeData)
+
+    Threads.@threads for i in 1:N
+        local_distance = Vector{Tuple{Int, Int, Float64}}()
+        distance = inrange(tree,[treeData[1,i], treeData[2,i]], cutoff, true)
+
+        for j in distance
+            @inbounds begin
+                if j <= i 
+                    continue
+                end
+
+                x1, y1 = treeData[1,i], treeData[2,i]
+                x2, y2 = treeData[1,j], treeData[2,j]
+                dis = sqrt((x1-x2)^2+(y1-y2)^2)
+                if dis <= cutoff && dis != 0
+                    push!(local_distance, (i, j, dis ))
+                    
+                end
+            end
+        end
+       
+        thread_id = Threads.threadid()
+        
+        if haskey(distance_dict, thread_id)
+            append!(distance_dict[thread_id], local_distance)
+        else
+            distance_dict[thread_id]= local_distance 
+
+        end
+    end
+    
+    all_distance = vcat(values(distance_dict)...)
+
+    return all_distance
+end
+
+
+
+function compute_distance(site_positions::Array{Tuple{Float64, Float64}},cutoff, N)
+    distance = Vector{Tuple{Int, Int, Float64}}()
+    for i in 1:N
+        for j in 1:N
+            @inbounds begin
+                x1, y1 = site_positions[i]
+                x2, y2 = site_positions[j]
+                dis = sqrt((x1-x2)^2+(y1-y2)^2)
+                if dis <= cutoff
+                    push!(distance, (i, j, dis))
+                end
+            end
+        end
+    end
+    return distance
+end
+
+
+function compute_distance_old(pos1::Array{Tuple{Float64, Float64}},pos2::Array{Tuple{Float64, Float64}})
+    x1, y1 = pos1
+    x2, y2 = pos2
+    return sqrt((x1-x2)^2+(y1-y2)^2)
+end
+
 function initialize_sites(site_positions::Array{Tuple{Float64, Float64}}, inputs::Uniform_bipartite_seed, length_thresh::Int64=40)
     total_input_normalization_factor = sum(inputs.proportions) # normalising the proportion
     weights = inputs.proportions/total_input_normalization_factor # normalise weigths
     sequences = inputs.sequences # extract sequence from object
     N =  length(site_positions) # number of sites
-    long_sites =  [] # empty  to store site positions with sequences longer than a threshold
-  
-    initialized_sites = [Site() for i in 1:N]
-    sites = Dict(zip(site_positions, initialized_sites)) # dictionary that  maps site positions to their corresponding Site objects.
+    test = 0
+    long_sites = Tuple{Float64, Float64}[]
+ 
+    #initialized_sites = [Site() for _ in 1:N]
+    #sites = Dict(zip(site_positions, initialized_sites)) # dictionary that  maps site positions to their corresponding Site objects.
+    #println(initialized_sites)
+   
+    initialized_sites = [Site() for _ in 1:N]
+    sites = Dict{Tuple{Float64, Float64}, Site}()
+    
+    for i in 1:N
+        sites[site_positions[i]] = initialized_sites[i]
+    end
 
     ### assign sequences to all sites in this loop###
     println("N is ", N)
@@ -304,66 +484,79 @@ function initialize_sites(site_positions::Array{Tuple{Float64, Float64}}, inputs
         main_sequence = bc_gen(sample(sequences, Weights(weights))) # smaple is a function from julia and randomly picks a sequence, here weigths are added with the Weigths function which provides a vector 
         # the main_sequence contains now the sequence with the unoque barcode attachet !
         main_site.seq = main_sequence
-        
-        L_MS = length(main_sequence)# length in bases 
-        ls_MS = L_MS*lbp # countor length is bases*lbp
-        if L_MS > length_thresh
-            #println(main_site.seq)
+       
+        if length(main_sequence) > length_thresh
+           
             push!(long_sites, site_positions[i])
+            push!(pc, site_positions[i]) # to store the initial template coordinates in a list --> they are stored as a tuble 
+            push!(p_seq, main_sequence)
+       
         end 
     end
     #distance_matrix = Array{Float64}(undef, N, N)
     println("\n assigning neighbors based on cutoff distance")
     ### check all pairwise distances and assign neighbors based on adaptive cutoff distance###
-    for i in 1:N   
+    
+    #println(sites)
+    Threads.@threads for i in 1:N   
         if i%1000 == 0
-            print(i)
+            print(i, " ")
         end
-        x1 = site_positions[i][1]
-        y1 = site_positions[i][2]
+        #x1 = site_positions[i][1]
+        #y1 = site_positions[i][2]
+        x1, y1 = site_positions[i]
         main_site = sites[site_positions[i]]
         L_MS = length(main_site.seq)
-        MS_cutoff =  L_MS*lbp  #136#L_MS*lbp # contour length is max - should be shorter though?
-        
+        MS_cutoff =  50 #L_MS*lbp  #136#L_MS*lbp # contour length is max - should be shorter though?
+
+
         for j in i+1:N 
+            candidate_position = site_positions[j]
             candidate_neighbor_site = sites[site_positions[j]]
             L_CNS = length(candidate_neighbor_site.seq)
-            CNS_cutoff = L_CNS*lbp #136# L_CNS*lbp
-            x2 = site_positions[j][1]
-            y2 = site_positions[j][2]
+            CNS_cutoff = 50 # L_CNS*lbp #136# L_CNS*lbp
+            #x2 = site_positions[j][1]
+            #y2 = site_positions[j][2]
+            x2, y2 = candidate_position
             distance = sqrt((x1-x2)^2+(y1-y2)^2) 
             p_interact_MS = p_end_to_end(L_MS, distance)
             p_interact_CNS = p_end_to_end(L_CNS, distance)
-            
+
             if MS_cutoff > distance
+                test += 1
                 # then this candidate and the main site are technically neighbors - some more likely than others though
                 # since we are performing and update, we need to check first what the status of the free_neighbors lists are in both main and candidate sites
                 if isdefined(sites[(x1,y1)], 2)
+                #if haskey(main_site, :free_neighbors)
                     # main site already has a free_neighbors entry, but it cannot have the candidate in it yet
                     # so in this case we will push the candidate to the existing entry
-                    #println("distance: ", distance)
-                    #
-                    #println("p_interact_MS: ", p_interact_MS)
-                    push!(main_site.free_neighbors, ((x2,y2), distance, p_interact_MS))    
+                 
+                    #push!(main_site.free_neighbors, ((x2,y2), distance, p_interact_MS))  
+                    push!(main_site.free_neighbors, (candidate_position, distance, p_interact_MS))  
                 else
                     # then this is the first iteration on the main site and it also has never been added as a neighbor by a previous main site
                     # in this case we create a new starting entry with the now-accepted neighbor candidate as the first of free_neighbors
-                    main_site.free_neighbors = [((x2,y2), distance, p_interact_MS)]  
+                    #main_site.free_neighbors = [((x2,y2), distance, p_interact_MS)]  
+                    main_site.free_neighbors = [(candidate_position, distance, p_interact_MS)] 
                 end
             else
                 # then the main site will not have this candidate as neighbor, nor will this candidate have main site as neighbor
             end
+
             if CNS_cutoff > distance
                 # then the candidate is also eligible to have main site as one of its neighbors
                 #now time to update the candidate as well
                 if isdefined(sites[(x2,y2)], 2)
+                #if haskey(candidate_neighbor_site, :free_neighbors)
                     # then the candidate has an already-defined set of free_neighbors
                     # in this case we push the main site onto the existing list
-                    push!(candidate_neighbor_site.free_neighbors, ((x1,y1), distance, p_interact_CNS))    
+                    #push!(candidate_neighbor_site.free_neighbors, ((x1,y1), distance, p_interact_CNS))  
+                    push!(candidate_neighbor_site.free_neighbors, (site_positions[i], distance, p_interact_CNS)) 
                 else
                     # if not definied, then there is no free_neighbors entry for this candidate
                     # we make a new one now, assigning the main site as the first entry
-                    candidate_neighbor_site.free_neighbors = [((x1,y1), distance, p_interact_CNS)] 
+                    #candidate_neighbor_site.free_neighbors = [((x1,y1), distance, p_interact_CNS)]
+                    candidate_neighbor_site.free_neighbors = [(site_positions[i], distance, p_interact_CNS)] 
                 end
             else
                 # then the candidate is not eligible to have main site as its neighbor, regardless of whether IT may be a neighbor in the main site
@@ -371,31 +564,232 @@ function initialize_sites(site_positions::Array{Tuple{Float64, Float64}}, inputs
         end
         
     end
+    #println(length(sites))
+    #println(length(long_sites))
+    println(test)
     return sites, long_sites#, distance_matrix
+end
+
+function List_initialize_sites(site_positions::Array{Tuple{Float64, Float64}}, inputs::Uniform_bipartite_seed, length_thresh::Int64=40)
+    total_input_normalization_factor = sum(inputs.proportions) # normalising the proportion
+    weights = inputs.proportions/total_input_normalization_factor # normalise weigths
+    sequences = inputs.sequences # extract sequence from object
+    N =  length(site_positions) # number of site
+    long_sites = Tuple{Float64, Float64}[]
+
+    initialized_sites = [Site() for _ in 1:N]
+    sites = Dict{Tuple{Float64, Float64}, Site}()
+    
+    global cutoff = 20 #L_MS*lbp  #136#L_MS*lbp # contour length is max - should be shorter though?
+
+    for i in 1:N
+        sites[site_positions[i]] = initialized_sites[i]
+    end
+    #println(sites)
+    ### assign sequences to all sites in this loop###
+    println("N is ", N)
+
+    # the following loop assigns each site with a sequence 
+    for i in 1:N   
+        if i%1000 == 0
+            print(i, " ")
+        end
+        main_site = sites[site_positions[i]]
+        main_sequence = bc_gen(sample(sequences, Weights(weights))) # smaple is a function from julia and randomly picks a sequence, here weigths are added with the Weigths function which provides a vector 
+        # the main_sequence contains now the sequence with the unoque barcode attachet !
+        main_site.seq = main_sequence
+       
+        if length(main_sequence) > length_thresh
+           
+            push!(long_sites, site_positions[i])
+            push!(pc, site_positions[i]) # to store the initial template coordinates in a list --> they are stored as a tuble 
+            push!(p_seq, main_sequence)
+       
+        end 
+    end
+    #distance_matrix = Array{Float64}(undef, N, N)
+    println("\n assigning neighbors based on cutoff distance")
+    ### check all pairwise distances and assign neighbors based on adaptive cutoff distance###
+    #println(site_positions)
+    distance_list = @time new_compute_distance(site_positions, cutoff, N) 
+    #println(distance_list)
+    println("compute_done")
+    
+    println(length(distance_list))
+   
+    #println(distance_list)
+    #println(distance_list)
+    num_entries = length(distance_list)
+
+    Threads.@threads for k in 1:num_entries 
+        i, j, val = distance_list[k]
+        if i <= j 
+            main_site = sites[site_positions[i]]
+            L_MS = length(main_site.seq)
+            candidate_position = site_positions[j]
+            site_po = site_positions[i]
+            candidate_neighbor_site = sites[site_positions[j]]
+            L_CNS = length(candidate_neighbor_site.seq)
+            MS_cutoff = 20
+            CNS_cutoff = 20 # L_CNS*lbp #136# L_CNS*lbp
+            x2, y2 = candidate_position
+            x1, y1 = site_po
+            p_interact_MS = p_end_to_end(L_MS, val)
+            p_interact_CNS = p_end_to_end(L_CNS, val)
+
+            if MS_cutoff > val
+ 
+                if isdefined(sites[(x1,y1)], 2)
+              
+                    push!(main_site.free_neighbors, (candidate_position, val, p_interact_MS))  
+                else
+                   
+                    main_site.free_neighbors = [(candidate_position, val, p_interact_MS)] 
+                end
+            else
+  
+            end
+
+            if CNS_cutoff > val
+              
+                if isdefined(sites[(x2,y2)], 2)
+             
+                    push!(candidate_neighbor_site.free_neighbors, (site_po, val, p_interact_CNS)) 
+                else
+            
+                    candidate_neighbor_site.free_neighbors = [(site_po, val, p_interact_CNS)] 
+                end
+            else
+              
+            end
+        end
+        
+    end
+    distance_list = nothing 
+    return sites, long_sites
+end
+
+
+
+function Matrix_initialize_sites(site_positions::Array{Tuple{Float64, Float64}}, inputs::Uniform_bipartite_seed, length_thresh::Int64=40)
+    total_input_normalization_factor = sum(inputs.proportions) # normalising the proportion
+    weights = inputs.proportions/total_input_normalization_factor # normalise weigths
+    sequences = inputs.sequences # extract sequence from object
+    N =  length(site_positions) # number of sites
+    all_UMI = []
+    long_sites = Tuple{Float64, Float64}[]
+ 
+ 
+    initialized_sites = [Site() for _ in 1:N]
+    sites = Dict{Tuple{Float64, Float64}, Site}()
+
+    for i in 1:N
+        sites[site_positions[i]] = initialized_sites[i]
+    end
+
+    ### assign sequences to all sites in this loop###
+    println("N is ", N)
+
+    # the following loop assigns each site with a sequence 
+    for i in 1:N   
+        if i%1000 == 0
+            print(i, " ")
+        end
+        main_site = sites[site_positions[i]]
+        main_sequence, UMI  = bc_gen(sample(sequences, Weights(weights))) # smaple is a function from julia and randomly picks a sequence, here weigths are added with the Weigths function which provides a vector 
+        # the main_sequence contains now the sequence with the unoque barcode attachet !
+        main_site.seq = main_sequence
+        main_site.UMI = UMI
+        if length(main_sequence) > length_thresh
+           
+            push!(long_sites, site_positions[i])
+            push!(pc, site_positions[i]) # to store the initial template coordinates in a list --> they are stored as a tuble 
+            push!(p_seq, main_sequence)
+            push!(all_UMI, UMI)
+       
+        end 
+    end
+    #distance_matrix = Array{Float64}(undef, N, N)
+    println("\n assigning neighbors based on cutoff distance")
+    ### check all pairwise distances and assign neighbors based on adaptive cutoff distance###
+    
+    global cutoff = 10 #L_MS*lbp  #136#L_MS*lbp # contour length is max - should be shorter though?
+
+    distance_list = @time matrix_compute_distance(site_positions, cutoff, N)
+    
+    println("compute_done")
+    
+    println(length(distance_list))
+
+    #println(distance_list)
+    #println(distance_list)
+    num_entries = length(distance_list)
+
+    Threads.@threads for k in 1:num_entries 
+        i, j, val = distance_list[k]
+        if i <= j 
+            main_site = sites[site_positions[i]]
+            L_MS = length(main_site.seq)
+            candidate_position = site_positions[j]
+            site_po = site_positions[i]
+            candidate_neighbor_site = sites[site_positions[j]]
+            L_CNS = length(candidate_neighbor_site.seq)
+            MS_cutoff = 10
+            CNS_cutoff = 10 # L_CNS*lbp #136# L_CNS*lbp
+            x2, y2 = candidate_position
+            x1, y1 = site_po
+            p_interact_MS = p_end_to_end(L_MS, val)
+            p_interact_CNS = p_end_to_end(L_CNS, val)
+
+            if MS_cutoff > val
+ 
+                if isdefined(sites[(x1,y1)], 2)
+              
+                    push!(main_site.free_neighbors, (candidate_position, val, p_interact_MS))  
+                else
+                   
+                    main_site.free_neighbors = [(candidate_position, val, p_interact_MS)] 
+                end
+            else
+  
+            end
+
+            if CNS_cutoff > val
+              
+                if isdefined(sites[(x2,y2)], 2)
+             
+                    push!(candidate_neighbor_site.free_neighbors, (site_po, val, p_interact_CNS)) 
+                else
+            
+                    candidate_neighbor_site.free_neighbors = [(site_po, val, p_interact_CNS)] 
+                end
+            else
+              
+            end
+        end
+        
+    end
+ 
+    return sites, long_sites, all_UMI
 end
 
 
 
 
 
-
-
-
-
-
-
-
-
 ###########################################
-# run parameters
+# run parameters 25.095617 seconds (734.15 M allocations: 17.539 GiB, 25.07% gc time, 5.50% compilation time)
 ###########################################
 
-site_density = 0.02546473*.01#0.02546473*.01#0.02546473*.01 #oligos per nm2 seems to be the minimal primer concentration needed to have a full coverd surface of PRIMERS not TEMPLATE
-spot_diameter = 1000.0*10#1000.0*10 #nm
+site_density = 0.07 #0.02546473*.01 #oligos per nm2 seems to be the minimal primer concentration needed to have a full coverd surface of PRIMERS not TEMPLATE
+spot_diameter = 5000.0*1 #1000.0*10 #nm
 site_area = π*(spot_diameter/2)^2
-primer_concentration_nM = 0.0212568*.01 # see your own  calculation
+#primer_concentration_nM = 0.0212568*.01 # see your own  calculation
 inputs = Uniform_bipartite_seed()
-inputs.proportions = [1,1,1,1,0.1,0.1]#[1,1,1,1,0.075,0.075]#[0.247,0.247,0.247,0.247,0.012,0.012] #[10,10,10,10,0.75,0.75] means rigth now that the required concentration for the templates is 10 times lower than the primer concentration to get 0.1 polonie per nm^2
+inputs.proportions = [1,1,1,1,0.0034,0.0034] #[1,1,1,1,0.00034,0.00034] #[1,1,1,1,0.001,0.001]#[1,1,1,1,0.075,0.075]#[0.247,0.247,0.247,0.247,0.012,0.012] #[10,10,10,10,0.75,0.75] means rigth now that the required concentration for the templates is 10 times lower than the primer concentration to get 0.1 polonie per nm^2
+# BC: 8 pM give rise to 0,6 million polonies per mm^2 --> proportion betwenn is 13,333 meaning that the chance of a template getting attached is 1 / 13,33 == 0,075 
+#[1,1,1,1,0.0034,0.0034]
+
 inputs.sequences = [
     BioSequence{DNAAlphabet{4}}("GGCCAACGGTGTCTCAATCAAC"),# strand a
     BioSequence{DNAAlphabet{4}}("GCTGCTAAGCCGGACTGAATTC"), #strand b 
@@ -404,16 +798,19 @@ inputs.sequences = [
     BioSequence{DNAAlphabet{4}}("GGCCAACGGTGTCTCAATCAACCGATGGCCGAGCTCACTATGTAACTTTTGAACTAGGGCCTCTCACTGCCCTATGTACTGACATCCCTGCAAGTATTTCGATATATTCAGTGTAGCAGTGTCGGGGAGTTGCTCTACCCCGAGTTGTCGGCATTATAACGATCACGTGTGTCACGCAGTTTCATAGTTACGTGTGTGATCGCCACACATGCGTAGCTCCCCATGCGCGGACCTAACGCTGAAATATCGTATCTCAGCTTCAACAGACTGGATTCATAAGCAAATTGGCTAAACAGACTCGTAATACGACTCACTATAGGGACACGACGCTCTTCCGATCTNNNNNNNNNNNNNNNNNNNNNNNNGTTGACAATACGCGAATTCAGTCCGGCTTAGCAGC"), #  alpha strand #GGCCAACGGTGTCTCAATCAACCGATGGCCGAGCTCACTATGTAACTTTTGAACTAGGGCCTCTCACTGCCCTATGTACTGACATCCCTGCAAGTATTTCGATATATTCAGTGTAGCAGTGTCGGGGAGTTGCTCTACCCCGAGTTGTCGGCATTATAACGATCACGTGTGTCACGCAGTTTCATAGTTACGTGTGTGATCGCCACACATGCGTAGCTCCCCATGCGCGGACCTAACGCTGAAATATCGTATCTCAGCTTCAACAGACTGGATTCATAAGCAAATTGGCTAAACAGACTCGTAATACGACTCACTATAGGGACACGACGCTCTTCCGATCTNNNNNNNNNNNNNNNNNNNNNNNNGTTGACAATACGCGAATTCAGTCCGGCTTAGCAGC
     BioSequence{DNAAlphabet{4}}("GCGGTTCCTGAACACGTTCGAAAAAAAAAAAAAAAAAAAAAATNNNNNNNNNNNNNNNNNNNNNNNNCGCGTATTGTCAACGGTCAATTGAGAGCCCCTGCACCGATCCGACGCATTTCGTTCAAGACATCCAGTTCGTAGTACCTCCCTGGAAATTCGGTGGCAGTTAAATCTAGATATCACATGGTTACAGGTCTCGTGAAGACCTGTACCCTGCCATCCGGAAAAGTTCATATGCCGTGGAAAATCTGGCACTGTTGGCAATTGTTCGACTTGCTATTCATAGTGACGTGCTGCATTTCAGATCAACTGCCAGGCAATGGGATACCCTTGGGATCAGGTAAGCAAGAATGCTATATCCGCAGGAGTAACCCTAGAGAATTCATTCTGCGGCAGTGCG") #   beta strand #GCGGTTCCTGAACACGTTCGAAAAAAAAAAAAAAAAAAAAAATNNNNNNNNNNNNNNNNNNNNNNNNCGCGTATTGTCAACGGTCAATTGAGAGCCCCTGCACCGATCCGACGCATTTCGTTCAAGACATCCAGTTCGTAGTACCTCCCTGGAAATTCGGTGGCAGTTAAATCTAGATATCACATGGTTACAGGTCTCGTGAAGACCTGTACCCTGCCATCCGGAAAAGTTCATATGCCGTGGAAAATCTGGCACTGTTGGCAATTGTTCGACTTGCTATTCATAGTGACGTGCTGCATTTCAGATCAACTGCCAGGCAATGGGATACCCTTGGGATCAGGTAAGCAAGAATGCTATATCCGCAGGAGTAACCCTAGAGAATTCATTCTGCGGCAGTGCG
 ]
+
 length_thresh = 40 #nt long to be considered a long strand
 global l_prime = 15
-n_cycles_2 = 5
+n_cycles_2 = 500
 global l_prime_2 = 13
 Temp = 50
 Temp_2 = 40
+
 ncpu = Sys.CPU_THREADS
 ENV["GKS_ENCODING"]="utf8"
 ENV["JULIA_NUM_THREADS"] = ncpu*2
 ENV["GKSwstype"]="nul"
+
 n_cycles = 30
 
 a_pol_f = Strand_tracker("TGCCCTATGTACTGACATCCCTGCAAGTATTTCG", "#d43737", "Alpha")
@@ -427,39 +824,29 @@ Random.seed!(1234);
 rejection_thresh = 10000
 
 
-open("TS_run_info.txt", "w") do io
-    write(io, "Number of cycles "*string(n_cycles)*" \n")
-    write(io, "spot diameter: "*string(spot_diameter)*"nm \n")
-    write(io, "spot area: "*string(site_area)*"nm2 \n")
-    write(io, "site density: "*string(site_density)*"strands per nm2 \n")
-    write(io, "input sequences used: "*string(inputs.sequences)*"\n")
-    write(io, "input 1_proportions of sequences: "*string(inputs.proportions)*"\n")
-    
-    end;
-
-
-
-
-
 
 
 
 ###########################################
 # main launch script
+
 ###########################################
 ΔH°, ΔS° = get_thermodynamic_parameters()
 global lp_ssDNA = 4.0 #nm # persistence length of ssDNA  #Bernard, Tinland (1997). "Persistence Length of Single-Stranded DNA". Macromolecules. 30 (19): 5763. Bibcode:1997MaMol..30.5763T. doi:10.1021/ma970381+.
 global lbp = 0.34 #nm # contour length of ssDNA by base 
 global lkuhn = 2.0*lp_ssDNA # kuhn length is 2x lp for WLC model: Rubinstein and Colby (2003). Polymer Physics
 global scoremodel = AffineGapScoreModel(EDNAFULL, gap_open=-5, gap_extend=-1);
+
 println("generating site positions")
 site_positions = generate_site_positions(Random_poisson_parameters(site_density,site_area)) 
 println(length(site_positions))
 println("initializing sites")
-sites, long_sites = initialize_sites(site_positions, inputs, length_thresh)
+sites, long_sites, UMI = @time Matrix_initialize_sites(site_positions, inputs, length_thresh)
 println("renormalizing site probabilities")
 sites = renormalize_site_probabilities(sites)
 println("beginning thermal cycling")
+#println("Polinies", pc)
+#println("UMI:", long_sites)
 
 global extension_vector = []
 #######################################
@@ -468,10 +855,23 @@ global extension_vector = []
 extension_events = 0
 a_ex = 0
 b_ex = 0
-for cycle in 1:n_cycles
-    
-    output_tracking_plot([a_pol_f,a_pol_r,b_pol_f,b_pol_r],site_positions,"TS_test_"*string(cycle+1000)*".png")
 
+global polonies = Dict{Int, Vector{Tuple}}()
+
+for i in 1:length(pc)   # prepare the dictionary. add empty list acording to the size of pc, numbers of initial templates, so that to thouse list the coordinaes of the neighboors can be added 
+    polonies[i] = []
+    push!(polonies[i], pc[i])
+end
+
+#
+#println(pc)
+
+for cycle in 1:n_cycles
+
+    if cycle%10 == 0
+        output_tracking_plot([a_pol_f,a_pol_r,b_pol_f,b_pol_r],site_positions,"1303_2Cycle_15_"*string(cycle+1000)*".png")
+    end
+    
     println("start of cycle: ", cycle, "number of long sites: ", length(long_sites), "extensions: ", extension_events)
     push!(extension_vector, extension_events)
     global free_long_sites = deepcopy(long_sites)
@@ -483,24 +883,23 @@ for cycle in 1:n_cycles
         shuffle!(free_long_sites)               # shuffel the free sequences
         candidate = pop!(free_long_sites)       # select last element from the free sites and store in in candidate and REMOVE it from the free sites list  
         global i_no += 1
-        
+        #println("Candidate", candidate)
         # now attempt a random interaction from the site_picks list
         if isdefined(sites[candidate],2)
             main_site = sites[candidate]
             
             weights = [j[3] for j in main_site.free_neighbors]
-            #println("weigths")
-            #println(weights)
+            
             choices = [j[1] for j in main_site.free_neighbors]
+            #println(choices)
+            #println(main_site.seq)
             partner_coordinates = sample(choices, Weights(weights))
             partner_site = sites[partner_coordinates]
             ############# pairwise local alignment check here! ###############
             seq_a = main_site.seq
-            #println("man_site-seq")
-            #println(seq_a)
+           
             seq_b = partner_site.seq
-            #println("partner_site-seq")
-            #println(seq_b)
+            
             if occursin(string(seq_a[end-l_prime:end]), string(reverse_complement(seq_b))) || occursin(string(seq_b[end-l_prime:end]), string(reverse_complement(seq_a))) #because exact match much quicker to search than performing pairwise align at this stage
                 full_align = pairalign(LocalAlignment(), seq_a, reverse_complement(seq_b), scoremodel)
                 p_anneal = get_p_annealing(Temp, get_T_m(full_align.aln.b; CNa = .1));
@@ -569,19 +968,34 @@ for cycle in 1:n_cycles
                                 extension_b = reverse_complement(seq_a[1:n_bases_2_fetch_seq_a])
                                 seq_b_new = seq_b*extension_b
                                 sites[partner_coordinates].seq = seq_b_new
-                                if isdefined(sites[partner_coordinates],2)                               
-                                    sites[partner_coordinates] = update_site(sites[partner_coordinates])  
-                                end                              
+                                #if isdefined(sites[partner_coordinates],2)    
+                                sites[partner_coordinates] = update_site(sites[partner_coordinates])  
+                                
+                                #else
+                                    #println(sites[partner_coordinates])
+
+                                
+                                #end                              
                                 update_strand_tracker!(a_pol_f,partner_coordinates,string(seq_b_new))
                                 update_strand_tracker!(a_pol_r,partner_coordinates,string(seq_b_new))
                                 update_strand_tracker!(b_pol_f,partner_coordinates,string(seq_b_new))
                                 update_strand_tracker!(b_pol_r,partner_coordinates,string(seq_b_new))
+                                
                                 global extension_events += 1
                                 global extension_events_this_cycle += 1
+
                                 if length(seq_b_new) > length_thresh
                                     push!(long_sites, partner_coordinates)
+                                  
+                                    for p in 1:length(pc)           # to store the coordinates of the extended strands, neighboors, to the dictionary according from which template they came 
+                                        if haskey(polonies, p)      # candidate is the main sequence so the strand that gets extended 
+                                            if candidate in polonies[p]
+                                                push!(polonies[p], partner_coordinates) # partner coordinates is the seed that got extended so a new seed was made, this one is also stored in the list bc in the next cycle it could bend over and extend 
+                                            end
+                                        end
+                                    end
                                 end   
-                                
+                                #println(polonies)
                             else
                                 #println("anneal with no b extension")
                                 seqb_extend = false
@@ -623,13 +1037,44 @@ x_data = Float64.(x_data)
 y_data = Float64.(y_data)
 #scatter(range(1,n_cycles), log.(max.(extension_vector, tiny_constant)), color="black",alpha=1,markerstrokewidth=.1,markersize=5,label = "total extensions", ylabel = "number of extensions", xlabel = "cycle")
 #scatter(log10.(x_data), log10.(y_data), smooth=:true, color="black",alpha=1,markerstrokewidth=.1,markersize=5, label = "total extensions", ylabel = "number of extensions", xlabel = "cycle")
-scatter(x_data, y_data, color="black",alpha=1,markerstrokewidth=.1,markersize=5, label = "total extensions", ylabel = "number of extensions", xlabel = "cycle", yscale=:log10, xscale=:log10)
+scatter(x_data, y_data, color="black",alpha=1,markerstrokewidth=.1,markersize=5, label = "total extensions", ylabel = "number of extensions", xlabel = "cycle", yaxis=:log10, xaxis=:log10)
 #plot!(x -> slope * x + intercept, label="Linear Fit")
 #plot!(yscale=log10, xscale=log10, color="black",alpha=1,markerstrokewidth=.1,markersize=5, label = "total extensions", ylabel = "number of extensions", xlabel = "cycle")
 plot!(size=(400,400))
-savefig("TS_extensions_per_cycle.png")
+savefig("1303_2Cycle_15_per_cycle.png")
 
 #yscale=:log10, xscale=:log10
+
+#######################################
+#      Polony size      #
+#######################################
+
+
+size, coor1, coor2 = polony_size(pc, polonies)
+
+writer = open("1303_2Cycle_15_polony_info.txt", "w")
+global max_distance = 0
+global distance_for = 0
+
+for i in 1:length(pc)
+    write(writer, "Polony "*string(i)*" \n")
+    write(writer, "Start X, Y coordinate: "*string(pc[i])*" \n")
+    write(writer, "Sequence: "*string(p_seq[i])*"\n")
+    write(writer, "Distance: "*string(size[i])*"nm \n")
+    write(writer, "Coordinates (X,Y) 1: "*string(coor1[i])*"\n")
+    write(writer, "Coordinates (X,Y) 2: "*string(coor2[i])*"\n")
+    write(writer, "Number of Neighboors: "*string(length(polonies[i]))*"\n")
+    write(writer,"\n")
+    global distance_for += size[i]
+    if size[i] > max_distance
+        global max_distance = size[i]
+    end
+end 
+
+close(writer)
+
+mean_distance = distance_for/length(size)
+
 
 #######################################
 #      quick and dirty ecori cut      #
@@ -649,17 +1094,20 @@ for i in 1:length(long_sites)
         #### MODIFY STRAND HERE WITH THE NEW SEQUENCE ####
         new_strand_index = findfirst(restriction_seq,inspected_seq)[1]+cut_index
         sites[long_sites[i]].seq = inspected_seq[1:new_strand_index-1]
-       # println("sites[long_sites[i]]")
+        #println("sites[long_sites[i]]")
         if isdefined(sites[long_sites[i]],2)
             #println(sites[long_sites[i]])
             sites[long_sites[i]] = update_site(sites[long_sites[i]])
+        #else
         end
-        #println(sites[long_sites[i]].seq)
+            #println(sites[long_sites[i]])
+        #end
     end
     if length(sites[long_sites[i]].seq) > length_thresh
         push!(new_long_sites, long_sites[i])
     end
 end
+
 long_sites = deepcopy(new_long_sites)
 
 
@@ -670,15 +1118,23 @@ long_sites = deepcopy(new_long_sites)
 # second round of annealing after cut
 ######################################
 
+# Second roudn should maybe have a higher rejection_threshold bc annealing is done for 30 min instead of 3-5 min
+
 l_prime = l_prime_2
 n_cycles = n_cycles_2
 Temp = Temp_2
-extension_events = 0
+extension_events_link = 0
+global ex_vec =[]
+
+
 for cycle in 1:n_cycles
-    output_tracking_plot([a_pol_f,a_pol_r,b_pol_f,b_pol_r,tracker_400],site_positions,"TS_test_"*string(cycle+2000)*".png")
+
+    if cycle%10 == 0
+    output_tracking_plot([a_pol_f,a_pol_r,b_pol_f,b_pol_r,tracker_400],site_positions,"1303_2Cycle_15_"*string(cycle+2000)*".png")
+    end
 
     #println("start of cycle: ", cycle, "number of long sites: ", length(long_sites), "extensions: ", extension_events)
-    
+    push!(ex_vec, extension_events_link)
     global free_long_sites = deepcopy(long_sites)
     global i_no = 0
     global annealings = 0
@@ -725,7 +1181,7 @@ for cycle in 1:n_cycles
                                 #### MODIFY STRAND HERE WITH THE NEW SEQUENCE ####
                                 sites[candidate].seq = seq_a_new
                                 sites[candidate] = update_site(sites[candidate])
-                                global extension_events += 1
+                                global extension_events_link += 1
                                 global extension_events_this_cycle += 1
                                 update_strand_tracker!(a_pol_f,candidate,string(seq_a_new))
                                 update_strand_tracker!(a_pol_r,candidate,string(seq_a_new))
@@ -746,20 +1202,21 @@ for cycle in 1:n_cycles
                                 extension_b = reverse_complement(seq_a[1:n_bases_2_fetch_seq_a])
                                 seq_b_new = seq_b*extension_b
                                 sites[partner_coordinates].seq = seq_b_new   
-                                if isdefined(sites[partner_coordinates],2)                            
-                                    sites[partner_coordinates] = update_site(sites[partner_coordinates])
-                                end                                
+                                #if isdefined(sites[partner_coordinates],2)                            
+                                sites[partner_coordinates] = update_site(sites[partner_coordinates])
+                                #end                                
                                 update_strand_tracker!(a_pol_f,partner_coordinates,string(seq_b_new))
                                 update_strand_tracker!(a_pol_r,partner_coordinates,string(seq_b_new))
                                 update_strand_tracker!(b_pol_f,partner_coordinates,string(seq_b_new))
                                 update_strand_tracker!(b_pol_r,partner_coordinates,string(seq_b_new))
                                 update_strand_tracker!(tracker_400,partner_coordinates,length(sites[candidate].seq))
-                                global extension_events += 1
+                                global extension_events_link += 1
                                 global extension_events_this_cycle += 1
                                 #println(seq_b_new)
-                                if length(seq_b_new) > length_thresh
-                                    push!(long_sites, partner_coordinates)
-                                end   
+                                #if length(seq_b_new) > length_thresh
+                                #    push!(long_sites, partner_coordinates)
+                           
+                                #end   
                             else
                                 #println("anneal with no b extension")
                                 seqb_extend = false
@@ -779,7 +1236,7 @@ for cycle in 1:n_cycles
             global reject_count += 1
         end #isdefined site check
     end #interaction loop
-    println("end of cycle: ", cycle, "number of long sites: ", length(long_sites), "cumulative extensions: ", extension_events)
+    println("end of cycle: ", cycle, "number of long sites: ", length(long_sites), "cumulative extensions: ", extension_events_link)
     println("    number of anealling rejections this cycle: ", reject_count)
     println("    number of attempted interactions this cycle: ", i_no)
     println("    number of annealing events this cycle: ", annealings)
@@ -787,18 +1244,90 @@ for cycle in 1:n_cycles
     #println(i_no - (annealings + reject_count))
 end #cycle loop
 
-search_seq = BioSequence{DNAAlphabet{4}}("AAAAAAAAAAAAAAAAAAAAAATNNNNNNNNNNNNNNNNNNNNNNNNCGCGTATTGTCAACNNNNNNNNNNNNNNNNNNNNNNNNAGATCGGAAGAGCGTCGTGTCCCTATAGTG")
-writer_r1 = FASTQ.Writer(open("TS_edge_strands_direct.fastq", "w"))
+search_seq = BioSequence{DNAAlphabet{4}}("AAAAAAAAAAAAAAAAAAAAAATNNNNNNNNNNNNNNNNNNNNNNNNCGCGTATTGTCAACNNNNNNNNNNNNNNNNNNNNNNNNAGATCGGAAGAGCGTCGTGTCCCTATAGTG")    # For what do we need that ?
+writer_r1 = FASTQ.Writer(open("1303_2Cycle_15_edge_strands_direct.fastq", "w"))
+
+UMI_counter = []
 
 for i in 1:length(long_sites)
     seq_i = sites[long_sites[i]].seq
-    
+    #println("seq_i:", seq_i)
+    if length(sites[long_sites[i]].UMI) == 0  && occursin("TTTTTTTTTTTTTTTTTTTTTT",string(seq_i))
+        index_a = findfirst("TTTTTTTTTTTTTTTTTTTTTT", string(seq_i))[1]
+        UMI_a = seq_i[index_a - 62 : index_a - 38]
+   
+    else
+        UMI_a = sites[long_sites[i]].UMI
+    end
+  
     if length(String(seq_i)) > 400 && occursin("TTTTTTTTTTTTTTTTTTTTTT",string(seq_i))
+       
         seq_i_string = string(seq_i)[end-200:end]
-        #println(seq_i_string)
         record_object_r1 = BioSequences.FASTQ.Record(string(i), seq_i_string, repeat([1],length(seq_i_string)))
         write(writer_r1, record_object_r1)
+        
+        both_UMI = string(seq_i)[findfirst(UMI_a, seq_i)[1]: findfirst("TTTTTTTTTTTTTTTTTTTTTT", string(seq_i))[1] - 1]
+
+
+        if both_UMI in UMI_counter
+
+        else
+            push!(UMI_counter, both_UMI)
+        end
     end
 end
+
+
+open("1303_2Cycle_15_run_info.txt", "w") do io
+    write(io, "Number of cycles "*string(n_cycles)*" \n")
+    write(io, "spot diameter: "*string(spot_diameter)*"nm \n")
+    write(io, "spot area: "*string(site_area)*"nm2 \n")
+    write(io, "site density: "*string(site_density)*"strands per nm2 \n")
+    write(io, "input sequences used: "*string(inputs.sequences)*"\n")
+    write(io, "input 1_proportions of sequences: "*string(inputs.proportions)*"\n")
+    write(io, "number of polonies: "*string(length(pc))*"\n")
+    write(io, "number of extensions: "*string(extension_events)*"\n")
+    write(io, "number of connected polonies: "*string(length(UMI_counter))*"\n")
+    write(io, "max. length between sites to connect: "*string(cutoff)*"\n")
+    write(io, "mean distance: "*string(mean_distance)*"\n")
+    write(io, "max. distance: "*string(max_distance)*"\n")
+    
+    end;
+
+x_data = collect(2:n_cycles)
+y_data = ex_vec[2:end]
+x_data = Float64.(x_data)
+y_data = Float64.(y_data)
+#scatter(range(1,n_cycles), log.(max.(extension_vector, tiny_constant)), color="black",alpha=1,markerstrokewidth=.1,markersize=5,label = "total extensions", ylabel = "number of extensions", xlabel = "cycle")
+#scatter(log10.(x_data), log10.(y_data), smooth=:true, color="black",alpha=1,markerstrokewidth=.1,markersize=5, label = "total extensions", ylabel = "number of extensions", xlabel = "cycle")
+scatter(x_data, y_data, color="black",alpha=1,markerstrokewidth=.1,markersize=5, label = "total extensions", ylabel = "number of extensions", xlabel = "cycle", yaxis=:log10, xaxis=:log10)
+#plot!(x -> slope * x + intercept, label="Linear Fit")
+#plot!(yscale=log10, xscale=log10, color="black",alpha=1,markerstrokewidth=.1,markersize=5, label = "total extensions", ylabel = "number of extensions", xlabel = "cycle")
+plot!(size=(400,400))
+savefig("1303_2Cycle_15_link_per_cycle.png")
+
+
+
+##GIF##
+
+#input_dir= "/Users/johanna.blumenthal/Desktop/Master/Code-version2/png_files/"
+
+#png_files = filter(x -> endswith(x, ".png"), readdir(input_dir))
+
+#if isempty(png_files)
+#    error("No PNG files found")
+#end 
+
+
+
+#output_gif = "/Users/johanna.blumenthal/Desktop/Master/Code-version2/output.gif"
+
+#duration = 0.1
+#images = [Images.load(joinpath(input_dir, file)) for file in png_files]
+
+
+#@info "Creating GIF ..."
+#FileIO.save(output_gif, cat(images..., dims=3), fps=1/duration)
+#@info ("GIF saved!")
 
 close(writer_r1)

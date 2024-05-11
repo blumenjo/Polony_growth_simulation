@@ -1,2 +1,2 @@
 # Polony_growth_simulation
-Simulating polony growth via thermal cycling on 2D and 3D surface
+Simulating polony growth via thermal cycling in 2D.
